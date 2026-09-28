@@ -1,0 +1,61 @@
+# Reusable Docker build+push template.
+#
+# Include from any app repo:
+#   include:
+#     - project: 'demo-org/ci-templates'
+#       ref: v1.0.0
+#       file: '/build-push.yml'
+#
+# Then define your own job extending .build_push_image, setting these variables:
+#   DOCKERFILE_PATH  -- path to the Dockerfile, e.g. backend/Dockerfile
+#   BUILD_CONTEXT    -- build context dir, e.g. backend
+#   ECR_REPO         -- target ECR repository name, e.g. demoapp-backend
+#   EXTRA_BUILD_ARGS -- optional, e.g. "--build-arg API_BASE= --build-arg EKS_PROXY=1"
+#
+# Tags pushed: $CI_COMMIT_SHORT_SHA and latest. Always --platform linux/amd64 (EKS
+# nodes in this project are amd64/t3.medium -- a build without this flag on Apple
+# Silicon produces an arm64-only image that ErrImagePull's on every node; real
+# incident, expenseapp, 2026-09-20).
+#
+# Requires CI/CD variables in the INCLUDING project: AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION (masked).
+
+.build_push_image:
+  image: docker:24-cli
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+  before_script:
+    # Alpine Python/awscli hits pyexpat+musl/expat bugs (confirmed live twice this
+    # project, both times inside plain Alpine images) -- delegate to the official
+    # amazon/aws-cli image via docker instead of installing aws-cli natively here.
+    - echo 'IyEvYmluL3NoCmV4ZWMgZG9ja2VyIHJ1biAtLXJtIC1lIEFXU19BQ0NFU1NfS0VZX0lEIC1lIEFXU19TRUNSRVRfQUNDRVNTX0tFWSAtZSBBV1NfU0VTU0lPTl9UT0tFTiAtZSBBV1NfREVGQVVMVF9SRUdJT04gYW1hem9uL2F3cy1jbGk6bGF0ZXN0ICIkQCIK' | base64 -d > /usr/local/bin/aws
+    - chmod +x /usr/local/bin/aws
+    - docker pull amazon/aws-cli:latest
+    - |
+      if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+        echo "Set CI/CD variable AWS_DEFAULT_REGION (e.g. ca-central-1)." >&2; exit 1
+      fi
+      if [ -z "${ECR_REPO:-}" ]; then
+        echo "Set this job's ECR_REPO variable (target ECR repository name)." >&2; exit 1
+      fi
+      if [ -z "${DOCKERFILE_PATH:-}" ]; then
+        echo "Set this job's DOCKERFILE_PATH variable." >&2; exit 1
+      fi
+      if [ -z "${BUILD_CONTEXT:-}" ]; then
+        echo "Set this job's BUILD_CONTEXT variable." >&2; exit 1
+      fi
+    - aws sts get-caller-identity
+    - export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+    - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - echo "ECR repo=$ECR_REPO tag=${CI_COMMIT_SHORT_SHA}"
+  script:
+    - docker build --platform linux/amd64 ${EXTRA_BUILD_ARGS} -t "local-image:${CI_COMMIT_SHORT_SHA}" -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT"
+    - docker tag "local-image:${CI_COMMIT_SHORT_SHA}" "${ECR_REGISTRY}/${ECR_REPO}:${CI_COMMIT_SHORT_SHA}"
+    - docker tag "local-image:${CI_COMMIT_SHORT_SHA}" "${ECR_REGISTRY}/${ECR_REPO}:latest"
+    - docker push "${ECR_REGISTRY}/${ECR_REPO}:${CI_COMMIT_SHORT_SHA}"
+    - docker push "${ECR_REGISTRY}/${ECR_REPO}:latest"

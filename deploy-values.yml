@@ -1,0 +1,89 @@
+# Reusable "deploy" template for the values.yaml + ArgoCD GitOps flow.
+#
+# This IS the deploy: bumping the image tag in a values file and pushing it
+# is what makes ArgoCD's own selfHeal actually roll out the new image --
+# this job just makes that git change, then waits for the cluster to
+# confirm it caught up.
+#
+# Include from any app repo:
+#   include:
+#     - project: 'demo-org/ci-templates'
+#       ref: v1.1.0
+#       file: '/deploy-values.yml'
+#
+# Then define your own job extending .deploy_values, setting these variables
+# (all space-separated lists, so one job can cover one service or several --
+# ARGOCD_APP and DEPLOYMENT_NAME must be the same length, in the same order):
+#   VALUES_FILE     -- values file(s) to bump, e.g. "values.yaml" or
+#                      "values-backend.yaml values-frontend.yaml"
+#   ARGOCD_APP      -- ArgoCD Application name(s) to wait on
+#   DEPLOYMENT_NAME -- Deployment name(s) for the rollout-status check
+#   K8S_NAMESPACE   -- namespace shared by all of the above
+#
+# A job extending this still needs its own `stage:`/`rules:`/`needs:` --
+# none are set here, same convention as .build_push_image.
+#
+# Anything that ISN'T generic across every service using this flow (e.g.
+# expenseapp's ALB security-group annotation sync, which only applies to
+# its own Ingress) stays in that repo's own job, appended with a
+# `!reference [.deploy_values, script]` line rather than being templated
+# here -- see expenseapp/.gitlab-ci.yml for a real example of this.
+#
+# Requires CI/CD variables in the INCLUDING project: AWS_ACCESS_KEY_ID,
+# AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, EKS_CLUSTER_NAME, and
+# GITOPS_PUSH_TOKEN (masked, write_repository).
+#
+# Plain POSIX `for x in $VAR` word-splitting is used throughout, not bash
+# arrays (`read -a`) -- Alpine's default /bin/sh (busybox ash) doesn't
+# support those, same reason the real expenseapp deploy job never used them.
+
+.deploy_values:
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache aws-cli kubectl git
+    - |
+      if [ -z "${GITOPS_PUSH_TOKEN:-}" ]; then
+        echo "Set CI/CD variable GITOPS_PUSH_TOKEN (masked, write_repository)." >&2; exit 1
+      fi
+      if [ -z "${EKS_CLUSTER_NAME:-}" ]; then
+        echo "Set this job's EKS_CLUSTER_NAME variable." >&2; exit 1
+      fi
+      echo "=== caller identity ===" && aws sts get-caller-identity
+      aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+  script:
+    - |
+      git config user.email "gitlab-ci@${CI_PROJECT_NAME}.local"
+      git config user.name "GitLab CI"
+      git fetch origin "${CI_DEFAULT_BRANCH}"
+      git checkout -B "${CI_DEFAULT_BRANCH}" "origin/${CI_DEFAULT_BRANCH}"
+      for f in $VALUES_FILE; do
+        sed -i "s#^  tag: .*#  tag: \"${CI_COMMIT_SHORT_SHA}\"#" "$f"
+        git add "$f"
+      done
+      if git diff --cached --quiet; then
+        echo "No changes to commit."
+      else
+        git commit -m "deploy: ${CI_COMMIT_SHORT_SHA}"
+        git push "https://oauth2:${GITOPS_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git" "HEAD:${CI_DEFAULT_BRANCH}"
+      fi
+    - |
+      for app in $ARGOCD_APP; do
+        echo "Waiting for ArgoCD to sync ${app}..."
+        i=0
+        while [ "$i" -lt 36 ]; do
+          SYNC=$(kubectl -n argocd get application "$app" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+          HEALTH=$(kubectl -n argocd get application "$app" -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+          echo "$app: sync=${SYNC:-<none>} health=${HEALTH:-<none>}"
+          if [ "$SYNC" = "Synced" ] && [ "$HEALTH" = "Healthy" ]; then break; fi
+          i=$((i + 1)); sleep 5
+        done
+        if [ "$SYNC" != "Synced" ] || [ "$HEALTH" != "Healthy" ]; then
+          echo "ERROR: ${app} did not reach Synced+Healthy within 3 minutes." >&2
+          kubectl -n argocd get application "$app" -o yaml || true
+          exit 1
+        fi
+      done
+    - |
+      for d in $DEPLOYMENT_NAME; do
+        kubectl rollout status "deployment/${d}" -n "$K8S_NAMESPACE" --timeout=300s
+      done
